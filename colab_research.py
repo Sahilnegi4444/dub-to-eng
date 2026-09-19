@@ -5,9 +5,10 @@ Automated Video Dubbing System - Optimized Studio Pipeline
 Key Architecture:
 1. Fast Demucs Stem Separation (single-pass --shifts=0 --overlap=0.1) -> vocals.wav & no_vocals.wav.
 2. Lightweight 16-kHz mono extraction for Whisper.
-3. Decoupled STT: Whisper runs task="transcribe" with word_timestamps=True and beam_size=1 (greedy decoding).
-4. Decoupled Translation: English translation is generated separately with length budgeting.
-5. Closed-Loop TTS Alignment: Synthesizes -> measures duration -> shortens text if too long -> applies mild atempo (<=1.25x).
+3. Decoupled STT: Whisper runs task="transcribe" with word_timestamps=True and beam_size=5 for maximum accuracy.
+4. Sentence & Clause Grouping: Groups Whisper fragments by punctuation (।, ., ?, !) and pauses (>=0.6s).
+5. Dynamic Translation Caching & Semantic Rewriter: Cached by transcript SHA-256 hash; retries without Hindi fallback; semantic contractions/compressions.
+6. Closed-Loop TTS Alignment: Synthesizes -> measures duration -> concise semantic rewrite if needed -> mild atempo (<=1.25x).
 6. Strict Hard Speech Windows: Each segment is placed strictly at its own start timestamp; gaps are preserved as silence/music.
 7. Stage Checkpointing: Stems, transcripts, translations, and TTS segments are cached to disk to prevent re-computation.
 8. Background Preservation: Clean Demucs no_vocals.wav is used as the backing track with zero generic noise reduction.
@@ -30,6 +31,7 @@ import concurrent.futures
 import time
 import shutil
 import re
+import hashlib
 from pathlib import Path
 
 # Automatically accept licenses without terminal prompts
@@ -267,16 +269,25 @@ def get_16k_mono_speech(vocals_audio: Path, output_dir: Path) -> Path:
 def transcribe_speech_native(vocals_16k_audio: Path, cache_dir: Path) -> tuple[list, str]:
     """
     Transcribes the isolated vocals stem in its native language with word timestamps.
-    Uses beam_size=1 (greedy decoding) for 3x faster inference. Caches output to JSON.
+    Uses beam_size=5 for maximum accuracy on fast speech and regional accents.
+    Caches output keyed by audio file signature to prevent cross-video cache reuse.
     """
-    transcript_cache_file = cache_dir / "transcript_native.json"
+    # Key transcript cache by audio file signature (size + mtime + name)
+    try:
+        audio_stat = vocals_16k_audio.stat()
+        audio_sig = f"{vocals_16k_audio.name}_{audio_stat.st_size}_{int(audio_stat.st_mtime)}"
+        audio_hash = hashlib.sha256(audio_sig.encode()).hexdigest()[:12]
+    except Exception:
+        audio_hash = "default"
+
+    transcript_cache_file = cache_dir / f"transcript_native_{audio_hash}.json"
     if transcript_cache_file.exists():
         with open(transcript_cache_file, "r", encoding="utf-8") as f:
             data = json.load(f)
             print(f"\n[TRANSCRIBE] Loaded {len(data['segments'])} cached segments from: {transcript_cache_file.name}")
             return data["segments"], data["language"]
 
-    print("\n[TRANSCRIBE] Running faster-whisper on 16kHz vocal stem (task='transcribe', beam_size=1)...")
+    print("\n[TRANSCRIBE] Running faster-whisper on 16kHz vocal stem (task='transcribe', beam_size=5)...")
     t0 = time.time()
     model = get_whisper_model()
 
@@ -291,7 +302,7 @@ def transcribe_speech_native(vocals_16k_audio: Path, cache_dir: Path) -> tuple[l
             speech_pad_ms=100
         ),
         word_timestamps=True,
-        beam_size=1  # Greedy decoding: 3-4x faster than beam_size=5
+        beam_size=5  # High-accuracy beam search (beam_size=5)
     )
 
     detected_lang = info.language
@@ -321,7 +332,7 @@ def transcribe_speech_native(vocals_16k_audio: Path, cache_dir: Path) -> tuple[l
         })
 
     elapsed = time.time() - t0
-    print(f"  ✓ Transcribed {len(native_segments)} segments in {elapsed:.2f}s (First speech starts at {native_segments[0]['start']:.2f}s)")
+    print(f"  ✓ Transcribed {len(native_segments)} raw fragments in {elapsed:.2f}s (First speech starts at {native_segments[0]['start']:.2f}s)")
 
     # Save to disk cache
     with open(transcript_cache_file, "w", encoding="utf-8") as f:
@@ -330,15 +341,105 @@ def transcribe_speech_native(vocals_16k_audio: Path, cache_dir: Path) -> tuple[l
     return native_segments, detected_lang
 
 # %% [markdown]
-# ### Step 5: Decoupled Translation with Length-Aware Shortening
-# Translates native transcript into English separately.
-# Includes lexical shortening to condense syllables if English is longer than original spoken duration.
+# ### Step 4b: Sentence & Clause Grouping
+# Groups consecutive Whisper fragments into complete semantic sentences based on
+# punctuation (।, ॥, ., ?, !) and conversational pauses (~0.5-0.8s).
+# The translated English is mapped back to the group's original start/end timestamps.
 
 # %%
-def condense_english_text(text: str) -> str:
+def group_speech_segments(
+    segments: list,
+    pause_threshold: float = 0.6,
+    max_duration: float = 12.0
+) -> list:
     """
-    Applies contractions and trims filler adverbs to shorten spoken English syllables.
+    Groups consecutive Whisper fragment segments into coherent sentences/clauses.
+    A group boundary is formed when:
+    1. A segment ends with sentence-ending punctuation (Hindi danda '।', '॥', '.', '?', '!').
+    2. The pause between the end of the current segment and the start of the next segment exceeds `pause_threshold` (~0.5-0.8s).
+    3. The accumulated group duration would exceed `max_duration` (preventing over-long segments).
+
+    The resulting grouped segment spans [group[0]['start'] -> group[-1]['end']] exactly,
+    preserving natural speech windows and ambient pauses on the timeline.
     """
+    if not segments:
+        return []
+
+    print(f"\n[CLAUSE GROUPING] Grouping {len(segments)} fragments into complete sentences (pause_gap >= {pause_threshold}s)...")
+    grouped = []
+    current_group = []
+
+    # Universal multilingual sentence terminators:
+    # Western: . ? ! | Indic: । (U+0964), ॥ (U+0965)
+    # CJK: 。 (U+3002), ！ (U+FF01), ？ (U+FF1F) | Arabic/Persian: ؟ (U+061F), ۔ (U+06D4)
+    SENTENCE_END_REGEX = re.compile(r"[।॥.?!。！？\u061F\u06D4](\s*[\"'\)\]»›”’\s]*)?$")
+
+    for i, seg in enumerate(segments):
+        current_group.append(seg)
+        text = seg["native_text"].strip()
+        ends_with_punct = bool(SENTENCE_END_REGEX.search(text))
+
+        # Check pause gap to the following segment
+        has_pause = False
+        if i < len(segments) - 1:
+            gap = segments[i + 1]["start"] - seg["end"]
+            if gap >= pause_threshold:
+                has_pause = True
+        else:
+            has_pause = True  # Final segment finishes the group
+
+        group_duration = current_group[-1]["end"] - current_group[0]["start"]
+        duration_exceeded = group_duration >= max_duration
+
+        if ends_with_punct or has_pause or duration_exceeded:
+            g_start = current_group[0]["start"]
+            g_end = current_group[-1]["end"]
+            g_text = " ".join(s["native_text"].strip() for s in current_group if s["native_text"].strip()).strip()
+
+            grouped.append({
+                "id": len(grouped) + 1,
+                "start": g_start,
+                "end": g_end,
+                "duration": round(max(g_end - g_start, 0.2), 3),
+                "native_text": g_text,
+                "fragment_count": len(current_group)
+            })
+            current_group = []
+
+    if current_group:
+        g_start = current_group[0]["start"]
+        g_end = current_group[-1]["end"]
+        g_text = " ".join(s["native_text"].strip() for s in current_group if s["native_text"].strip()).strip()
+        grouped.append({
+            "id": len(grouped) + 1,
+            "start": g_start,
+            "end": g_end,
+            "duration": round(max(g_end - g_start, 0.2), 3),
+            "native_text": g_text,
+            "fragment_count": len(current_group)
+        })
+
+    print(f"  ✓ Merged into {len(grouped)} complete sentence clauses (avg {len(segments)/max(len(grouped), 1):.1f} fragments/clause)")
+    return grouped
+
+# %% [markdown]
+# ### Step 5: Decoupled Translation with Semantic-Preserving Rewriting
+# Translates grouped sentence clauses as unified semantic units into English.
+# Replaces naive filler removal with semantic-preserving contractions and concise phrasing.
+# Keys translation cache by SHA-256 hash of the transcript to prevent cross-video cache reuse.
+# Retries translation and NEVER falls back to Hindi text as English.
+
+# %%
+def semantic_concise_rewrite(text: str) -> str:
+    """
+    Produces a semantic-preserving concise rewrite of English text without altering meaning.
+    Applies spoken contractions and compresses wordy periphrastic phrasing into direct equivalents.
+    NOTE: NEVER deletes modifier/emphasis words like 'really', 'just', 'actually' as that distorts semantics.
+    """
+    if not text:
+        return ""
+
+    # 1. Natural spoken contractions (100% semantic identity, reduces syllable count)
     contractions = {
         r"\bI am\b": "I'm",
         r"\bdo not\b": "don't",
@@ -355,47 +456,117 @@ def condense_english_text(text: str) -> str:
         r"\bhas not\b": "hasn't",
         r"\bwould not\b": "wouldn't",
         r"\bshould not\b": "shouldn't",
-        r"\bcould not\b": "couldn't"
+        r"\bcould not\b": "couldn't",
+        r"\bwe will\b": "we'll",
+        r"\bthey will\b": "they'll",
+        r"\byou will\b": "you'll",
+        r"\bI will\b": "I'll",
+        r"\bI have\b": "I've",
+        r"\byou have\b": "you've",
+        r"\bwe have\b": "we've",
+        r"\bthey have\b": "they've"
     }
     shortened = text
     for pattern, repl in contractions.items():
         shortened = re.sub(pattern, repl, shortened, flags=re.IGNORECASE)
 
-    # Trim redundant conversational fillers if sentence is overly long
-    fillers = [r"\bbasically\b", r"\bactually\b", r"\bliterally\b", r"\bdefinitely\b", r"\breally\b", r"\bjust\b"]
-    for f in fillers:
-        shortened = re.sub(f, "", shortened, flags=re.IGNORECASE)
+    # 2. Semantic periphrastic compressions (concise synonyms preserving exact nuance)
+    semantic_compressions = [
+        (r"\bin order to\b", "to"),
+        (r"\bdue to the fact that\b", "because"),
+        (r"\bat this point in time\b", "now"),
+        (r"\bat the present moment\b", "currently"),
+        (r"\ba large number of\b", "many"),
+        (r"\bfor the purpose of\b", "for"),
+        (r"\bin the event that\b", "if"),
+        (r"\bwith the exception of\b", "except"),
+        (r"\bas a matter of fact\b", "in fact"),
+        (r"\bmake a decision\b", "decide"),
+        (r"\btake into consideration\b", "consider"),
+        (r"\bgive an explanation\b", "explain"),
+        (r"\bis able to\b", "can"),
+        (r"\bare able to\b", "can"),
+        (r"\bhas the ability to\b", "can"),
+        (r"\bhave the ability to\b", "can"),
+        (r"\bhas got to\b", "must"),
+        (r"\bhave got to\b", "must"),
+        (r"\bin spite of the fact that\b", "although"),
+        (r"\buntil such time as\b", "until"),
+        (r"\bprior to\b", "before"),
+        (r"\bsubsequent to\b", "after"),
+        (r"\ba sufficient amount of\b", "enough")
+    ]
+    for pattern, repl in semantic_compressions:
+        shortened = re.sub(pattern, repl, shortened, flags=re.IGNORECASE)
 
-    # Clean double spaces
+    # Clean redundant spaces
     shortened = re.sub(r"\s+", " ", shortened).strip()
     return shortened
 
-def translate_segments_decoupled(segments: list, source_lang: str, cache_dir: Path) -> list:
+def translate_grouped_segments(
+    segments: list,
+    source_lang: str,
+    cache_dir: Path,
+    target_lang: str = "en"
+) -> list:
     """
-    Translates native segments to English independently. Caches output to translations.json.
+    Translates grouped sentence clauses to English (or target language) as unified units.
+    - Keys cache by SHA-256 hash of (source_lang + target_lang + transcript_content).
+    - Prevents any accidental cache reuse across videos or languages.
+    - Retries translation with exponential backoff.
+    - NEVER falls back to untranslated source text: marks failed segments to prevent foreign text in TTS.
     """
-    trans_cache_file = cache_dir / "translations_english.json"
+    if not segments:
+        return []
+
+    # Dynamic cache key derived from source_lang + target_lang + transcript content
+    src = source_lang.lower().strip()
+    tgt = target_lang.lower().strip()
+    transcript_blob = "||".join(f"{s['id']}:{s['native_text']}" for s in segments)
+    content_key = f"{src}->{tgt}||{transcript_blob}"
+    transcript_hash = hashlib.sha256(content_key.encode("utf-8")).hexdigest()[:12]
+    trans_cache_file = cache_dir / f"translations_{src}_to_{tgt}_{transcript_hash}.json"
+
     if trans_cache_file.exists():
         with open(trans_cache_file, "r", encoding="utf-8") as f:
             cached_segs = json.load(f)
-            print(f"\n[TRANSLATION] Loaded {len(cached_segs)} cached translations from: {trans_cache_file.name}")
+            print(f"\n[TRANSLATION] Loaded {len(cached_segs)} cached translations ({src.upper()} -> {tgt.upper()}) from: {trans_cache_file.name}")
             return cached_segs
 
-    print(f"\n[TRANSLATION] Translating {len(segments)} segments ({source_lang.upper()} -> EN) separately...")
+    print(f"\n[TRANSLATION] Translating {len(segments)} sentence clauses ({src.upper()} -> {tgt.upper()}) as coherent units...")
     t0 = time.time()
-    translator = GoogleTranslator(source=source_lang, target="en")
+    translator = GoogleTranslator(source=src, target=tgt)
 
     for seg in segments:
-        native = seg["native_text"]
-        try:
-            english = translator.translate(native)
-        except Exception:
-            english = native
-        seg["english_text"] = english.strip()
-        seg["shortened_text"] = condense_english_text(english)
+        native = seg["native_text"].strip()
+        english = ""
+        max_retries = 3
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                res = translator.translate(native)
+                if res and res.strip():
+                    english = res.strip()
+                    break
+            except Exception as e:
+                if attempt < max_retries:
+                    time.sleep(0.7 * attempt)
+                else:
+                    print(f"  ⚠ Segment {seg['id']} translation attempt {attempt} failed: {e}")
+
+        if english:
+            seg["english_text"] = english
+            seg["concise_text"] = semantic_concise_rewrite(english)
+            seg["translation_failed"] = False
+        else:
+            # Strictly do NOT fall back to native source text!
+            print(f"  ⚠ Translation permanently failed for clause {seg['id']}: '{native[:40]}...'. Marked as failed (zero untranslated text in TTS).")
+            seg["english_text"] = ""
+            seg["concise_text"] = ""
+            seg["translation_failed"] = True
 
     elapsed = time.time() - t0
-    print(f"  ✓ Translation completed in {elapsed:.2f}s")
+    print(f"  ✓ Translation completed in {elapsed:.2f}s (Cache saved: {trans_cache_file.name})")
 
     with open(trans_cache_file, "w", encoding="utf-8") as f:
         json.dump(segments, f, indent=2, ensure_ascii=False)
@@ -438,6 +609,10 @@ def extract_clean_reference(vocals_path: Path, segments: list, output_ref_path: 
     return output_ref_path
 
 def detect_speaker_profile(audio_path: Path, detected_lang: str = "en") -> str:
+    """
+    Analyzes clean reference speech pitch (F0) and selects an appropriate regional English
+    neural voice matching speaker gender and source accent profile.
+    """
     try:
         import numpy as np
         sound = AudioSegment.from_file(audio_path)[:30000]
@@ -452,13 +627,33 @@ def detect_speaker_profile(audio_path: Path, detected_lang: str = "en") -> str:
         peak_lag = min_lag + np.argmax(corr[min_lag:max_lag])
         f0 = rate / peak_lag
         print(f"  → Clean Vocal Pitch (F0): {f0:.1f} Hz")
-        is_female = (f0 > 190)
+        is_female = (f0 > 185)
     except Exception:
         is_female = False
 
-    if detected_lang.lower() == "hi":
+    lang = (detected_lang or "en").lower().strip()
+
+    # Regional accent-aware English voice mappings
+    if lang in ["hi", "ur", "pa", "bn", "ta", "te", "mr", "gu", "kn", "ml"]:
+        # South Asian languages -> Indian English Neural
         return "en-IN-NeerjaNeural" if is_female else "en-IN-PrabhatNeural"
+    elif lang in ["de", "nl", "da", "sv", "no"]:
+        # Germanic / Northern European -> British English (natural European pacing)
+        return "en-GB-SoniaNeural" if is_female else "en-GB-RyanNeural"
+    elif lang in ["fr", "it", "es", "pt"]:
+        # Romance languages -> Expressive British/International English
+        return "en-GB-LibbyNeural" if is_female else "en-GB-ThomasNeural"
+    elif lang in ["ja", "zh", "ko"]:
+        # East Asian -> Modern crisp neural English
+        return "en-US-AvaNeural" if is_female else "en-US-ChristopherNeural"
+    elif lang in ["ar", "fa", "he", "tr"]:
+        # Middle Eastern / Mediterranean -> Warm neural English
+        return "en-US-JennyNeural" if is_female else "en-US-GuyNeural"
+    elif lang in ["ru", "uk", "pl", "cs", "ro"]:
+        # Eastern European -> Clear standard neural English
+        return "en-US-AvaNeural" if is_female else "en-US-ChristopherNeural"
     else:
+        # Global Default -> High-fidelity US English
         return "en-US-AvaNeural" if is_female else "en-US-ChristopherNeural"
 
 def synthesize_single_segment_tts(text: str, output_wav: Path, engine: str, voice_or_ref, device: str = "cuda"):
@@ -494,10 +689,20 @@ def fit_closed_loop_segment(
 ):
     """
     Closed-Loop Duration Feedback:
-    Synthesize -> measure duration -> shorten text if too long -> regenerate -> mild atempo (<=1.25x).
+    Synthesize -> measure duration -> concise semantic rewrite if necessary -> regenerate -> mild atempo (<=1.25x).
     Guarantees segment fits strictly into [start -> end] without bleeding into the next segment.
+    If translation failed, outputs silence for the exact speech window to prevent foreign text corruption.
     """
     target_sec = seg["duration"]
+    max_ms = int(target_sec * 1000)
+
+    # 0. Translation failure guard: never speak Hindi in English TTS
+    if seg.get("translation_failed") or not seg.get("english_text"):
+        AudioSegment.silent(duration=max_ms).export(output_final_wav, format="wav")
+        seg["tts_audio_path"] = output_final_wav
+        seg["final_duration"] = target_sec
+        return
+
     temp_wav_1 = temp_dir / f"raw1_{seg['id']:04d}.wav"
 
     # 1. First synthesis pass (standard translation)
@@ -506,14 +711,15 @@ def fit_closed_loop_segment(
 
     dur_1 = len(AudioSegment.from_file(temp_wav_1)) / 1000.0
 
-    # 2. Closed-loop check: if speech is significantly longer than original slot (>15%)
+    # 2. Closed-loop check: if speech is significantly longer than original slot (>12%)
     chosen_wav = temp_wav_1
     current_dur = dur_1
 
-    if dur_1 > target_sec * 1.15 and seg.get("shortened_text") and seg["shortened_text"] != text_to_try:
+    concise_text = seg.get("concise_text", "")
+    if dur_1 > target_sec * 1.12 and concise_text and concise_text != text_to_try:
         temp_wav_2 = temp_dir / f"raw2_{seg['id']:04d}.wav"
-        # Re-synthesize with condensed translation
-        synthesize_single_segment_tts(seg["shortened_text"], temp_wav_2, engine, voice_or_ref, device)
+        # Re-synthesize with semantic concise rewrite
+        synthesize_single_segment_tts(concise_text, temp_wav_2, engine, voice_or_ref, device)
         dur_2 = len(AudioSegment.from_file(temp_wav_2)) / 1000.0
         chosen_wav = temp_wav_2
         current_dur = dur_2
@@ -535,7 +741,6 @@ def fit_closed_loop_segment(
         final_sound = AudioSegment.from_file(chosen_wav)
 
     # 4. Hard Speech Window Guard: Strictly trim if it still exceeds target_sec with a micro-fadeout
-    max_ms = int(target_sec * 1000)
     if len(final_sound) > max_ms:
         final_sound = final_sound[:max_ms].fade_out(25)
 
@@ -643,11 +848,14 @@ def run_dubbing_pipeline(
     # 3. Lightweight 16kHz mono extraction for Whisper
     vocals_16k_path = get_16k_mono_speech(vocals_path, WORKSPACE_DIR)
 
-    # 4. Decoupled STT: Native Transcription (task='transcribe', beam_size=1, word_timestamps=True)
-    segments, source_lang = transcribe_speech_native(vocals_16k_path, CACHE_DIR)
+    # 4. Decoupled STT: Native Transcription (task='transcribe', beam_size=5, word_timestamps=True)
+    raw_segments, source_lang = transcribe_speech_native(vocals_16k_path, CACHE_DIR)
 
-    # 5. Decoupled Translation with Length-Aware Shortening
-    segments = translate_segments_decoupled(segments, source_lang, CACHE_DIR)
+    # 4b. Sentence & Clause Grouping (Merge Whisper fragments by punctuation and 0.6s pauses)
+    segments = group_speech_segments(raw_segments, pause_threshold=0.6, max_duration=12.0)
+
+    # 5. Decoupled Translation with Dynamic Hash Caching & Semantic-Preserving Rewriter
+    segments = translate_grouped_segments(segments, source_lang, CACHE_DIR)
 
     # 6. Closed-Loop Voice Synthesis (Measure -> Shorten -> Mild Atempo)
     tts_dir = WORKSPACE_DIR / "tts_segments"

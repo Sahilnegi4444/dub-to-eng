@@ -369,10 +369,7 @@ def group_speech_segments(
     grouped = []
     current_group = []
 
-    # Universal multilingual sentence terminators:
-    # Western: . ? ! | Indic: । (U+0964), ॥ (U+0965)
-    # CJK: 。 (U+3002), ！ (U+FF01), ？ (U+FF1F) | Arabic/Persian: ؟ (U+061F), ۔ (U+06D4)
-    SENTENCE_END_REGEX = re.compile(r"[।॥.?!。！？\u061F\u06D4](\s*[\"'\)\]»›”’\s]*)?$")
+    SENTENCE_END_REGEX = re.compile(r"[।॥.?!](\s*[\"']\s*)?$")
 
     for i, seg in enumerate(segments):
         current_group.append(seg)
@@ -503,39 +500,30 @@ def semantic_concise_rewrite(text: str) -> str:
     shortened = re.sub(r"\s+", " ", shortened).strip()
     return shortened
 
-def translate_grouped_segments(
-    segments: list,
-    source_lang: str,
-    cache_dir: Path,
-    target_lang: str = "en"
-) -> list:
+def translate_grouped_segments(segments: list, source_lang: str, cache_dir: Path) -> list:
     """
-    Translates grouped sentence clauses to English (or target language) as unified units.
-    - Keys cache by SHA-256 hash of (source_lang + target_lang + transcript_content).
-    - Prevents any accidental cache reuse across videos or languages.
-    - Retries translation with exponential backoff.
-    - NEVER falls back to untranslated source text: marks failed segments to prevent foreign text in TTS.
+    Translates grouped sentence clauses to English as unified units.
+    - Keys cache by SHA-256 hash of native transcript text to prevent cross-video cache reuse.
+    - Retries translation with backoff.
+    - NEVER falls back to Hindi text as English: marks failed segments to prevent foreign text injection into English TTS.
     """
     if not segments:
         return []
 
-    # Dynamic cache key derived from source_lang + target_lang + transcript content
-    src = source_lang.lower().strip()
-    tgt = target_lang.lower().strip()
+    # Dynamic cache key derived from current transcript content
     transcript_blob = "||".join(f"{s['id']}:{s['native_text']}" for s in segments)
-    content_key = f"{src}->{tgt}||{transcript_blob}"
-    transcript_hash = hashlib.sha256(content_key.encode("utf-8")).hexdigest()[:12]
-    trans_cache_file = cache_dir / f"translations_{src}_to_{tgt}_{transcript_hash}.json"
+    transcript_hash = hashlib.sha256(transcript_blob.encode("utf-8")).hexdigest()[:12]
+    trans_cache_file = cache_dir / f"translations_english_{transcript_hash}.json"
 
     if trans_cache_file.exists():
         with open(trans_cache_file, "r", encoding="utf-8") as f:
             cached_segs = json.load(f)
-            print(f"\n[TRANSLATION] Loaded {len(cached_segs)} cached translations ({src.upper()} -> {tgt.upper()}) from: {trans_cache_file.name}")
+            print(f"\n[TRANSLATION] Loaded {len(cached_segs)} cached translations from: {trans_cache_file.name}")
             return cached_segs
 
-    print(f"\n[TRANSLATION] Translating {len(segments)} sentence clauses ({src.upper()} -> {tgt.upper()}) as coherent units...")
+    print(f"\n[TRANSLATION] Translating {len(segments)} sentence clauses ({source_lang.upper()} -> EN)...")
     t0 = time.time()
-    translator = GoogleTranslator(source=src, target=tgt)
+    translator = GoogleTranslator(source=source_lang, target="en")
 
     for seg in segments:
         native = seg["native_text"].strip()
@@ -559,8 +547,8 @@ def translate_grouped_segments(
             seg["concise_text"] = semantic_concise_rewrite(english)
             seg["translation_failed"] = False
         else:
-            # Strictly do NOT fall back to native source text!
-            print(f"  ⚠ Translation permanently failed for clause {seg['id']}: '{native[:40]}...'. Marked as failed (zero untranslated text in TTS).")
+            # Strictly do NOT fall back to native Hindi!
+            print(f"  ⚠ Translation permanently failed for clause {seg['id']}: '{native[:40]}...'. Marked as failed (zero Hindi in English TTS).")
             seg["english_text"] = ""
             seg["concise_text"] = ""
             seg["translation_failed"] = True
@@ -609,10 +597,6 @@ def extract_clean_reference(vocals_path: Path, segments: list, output_ref_path: 
     return output_ref_path
 
 def detect_speaker_profile(audio_path: Path, detected_lang: str = "en") -> str:
-    """
-    Analyzes clean reference speech pitch (F0) and selects an appropriate regional English
-    neural voice matching speaker gender and source accent profile.
-    """
     try:
         import numpy as np
         sound = AudioSegment.from_file(audio_path)[:30000]
@@ -627,33 +611,13 @@ def detect_speaker_profile(audio_path: Path, detected_lang: str = "en") -> str:
         peak_lag = min_lag + np.argmax(corr[min_lag:max_lag])
         f0 = rate / peak_lag
         print(f"  → Clean Vocal Pitch (F0): {f0:.1f} Hz")
-        is_female = (f0 > 185)
+        is_female = (f0 > 190)
     except Exception:
         is_female = False
 
-    lang = (detected_lang or "en").lower().strip()
-
-    # Regional accent-aware English voice mappings
-    if lang in ["hi", "ur", "pa", "bn", "ta", "te", "mr", "gu", "kn", "ml"]:
-        # South Asian languages -> Indian English Neural
+    if detected_lang.lower() == "hi":
         return "en-IN-NeerjaNeural" if is_female else "en-IN-PrabhatNeural"
-    elif lang in ["de", "nl", "da", "sv", "no"]:
-        # Germanic / Northern European -> British English (natural European pacing)
-        return "en-GB-SoniaNeural" if is_female else "en-GB-RyanNeural"
-    elif lang in ["fr", "it", "es", "pt"]:
-        # Romance languages -> Expressive British/International English
-        return "en-GB-LibbyNeural" if is_female else "en-GB-ThomasNeural"
-    elif lang in ["ja", "zh", "ko"]:
-        # East Asian -> Modern crisp neural English
-        return "en-US-AvaNeural" if is_female else "en-US-ChristopherNeural"
-    elif lang in ["ar", "fa", "he", "tr"]:
-        # Middle Eastern / Mediterranean -> Warm neural English
-        return "en-US-JennyNeural" if is_female else "en-US-GuyNeural"
-    elif lang in ["ru", "uk", "pl", "cs", "ro"]:
-        # Eastern European -> Clear standard neural English
-        return "en-US-AvaNeural" if is_female else "en-US-ChristopherNeural"
     else:
-        # Global Default -> High-fidelity US English
         return "en-US-AvaNeural" if is_female else "en-US-ChristopherNeural"
 
 def synthesize_single_segment_tts(text: str, output_wav: Path, engine: str, voice_or_ref, device: str = "cuda"):
